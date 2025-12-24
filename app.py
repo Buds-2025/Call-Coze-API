@@ -3,6 +3,7 @@ import requests
 import json
 import time
 import re
+from utils import parse_curl, extract_content_universally, load_presets, save_presets
 
 # 设置页面配置
 st.set_page_config(
@@ -11,88 +12,31 @@ st.set_page_config(
     layout="wide"
 )
 
+# 初始化预设
+if "presets" not in st.session_state:
+    st.session_state.presets = load_presets()
+
 # 初始化会话状态
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "api_url" not in st.session_state:
-    st.session_state.api_url = "https://zfwgj2s2zx.coze.site/stream_run"
+    st.session_state.api_url = ""
 if "api_token" not in st.session_state:
     st.session_state.api_token = ""
 if "project_id" not in st.session_state:
     st.session_state.project_id = ""
+if "stop_generation" not in st.session_state:
+    st.session_state.stop_generation = False
 
-def parse_curl(curl_str):
-    """
-    解析 Curl 命令并提取 URL, Token 和 Project ID
-    """
-    results = {}
-    
-    # 提取 URL
-    url_match = re.search(r'https?://[^\s\"`]+', curl_str)
-    if url_match:
-        results['api_url'] = url_match.group(0).strip('`').strip()
-    
-    # 提取 Authorization Token
-    token_match = re.search(r'Bearer\s+([^\s\'\"]+)', curl_str)
-    if token_match:
-        results['api_token'] = token_match.group(1).strip()
-    
-    # 提取 project_id (从 JSON 数据中)
-    project_id_match = re.search(r'["\']project_id["\']\s*:\s*(\d+)', curl_str)
-    if project_id_match:
-        results['project_id'] = project_id_match.group(1).strip()
-    
-    return results
+def is_image_url(text):
+    """简单判断是否为图片链接"""
+    image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']
+    return any(text.lower().endswith(ext) for ext in image_extensions) or "image" in text.lower() and "http" in text.lower()
 
-def extract_content_universally(obj):
-    """
-    先进的递归内容提取算法：一劳永逸地处理所有嵌套 JSON 结构。
-    通过黑名单过滤元数据，提取所有可能的有效文本。
-    """
-    # 定义元数据黑名单（这些字段通常包含 ID、状态码或配置，不是我们要显示的文本）
-    METADATA_KEYS = {
-        'msg_id', 'log_id', 'session_id', 'reply_id', 'sequence_id', 
-        'type', 'event', 'finish', 'tool_call_id', 'code', 'execute_id',
-        'local_msg_id', 'query_msg_id', 'is_finished', 'time_cost_ms'
-    }
-    
-    # 定义高优先级内容键（如果找到这些键，直接返回其值）
-    PRIORITY_KEYS = ['answer', 'result', 'text', 'thinking', 'content']
-
-    if isinstance(obj, dict):
-        # 1. 特殊处理工具调用请求
-        if obj.get('type') == 'tool_request' or 'tool_request' in obj:
-            tool_data = obj.get('tool_request') or obj
-            if isinstance(tool_data, dict) and 'tool_name' in tool_data:
-                return f"\n> 🛠️ **正在调用工具: {tool_data['tool_name']}...**\n"
-
-        # 2. 尝试高优先级键
-        for key in PRIORITY_KEYS:
-            if key in obj and obj[key]:
-                res = extract_content_universally(obj[key])
-                if res: return res
-
-        # 3. 递归搜索所有其他键（排除黑名单）
-        for k, v in obj.items():
-            if k not in METADATA_KEYS and v:
-                res = extract_content_universally(v)
-                if res: return res
-                
-    elif isinstance(obj, list):
-        for item in obj:
-            res = extract_content_universally(item)
-            if res: return res
-            
-    elif isinstance(obj, str):
-        # 排除掉看起来像 ID 或 UUID 的字符串
-        if len(obj) > 0 and not (len(obj) > 20 and '-' in obj and obj.replace('-', '').isalnum()):
-            return obj
-            
-    return ""
-
-def call_coze_api_stream(api_url, api_token, project_id, user_query):
+def call_coze_api_stream(api_url, api_token, project_id, user_query, retries=1):
     """
     调用 Coze 智能体 API 并返回生成器以支持流式显示
+    包含自动重试机制
     """
     headers = {
         "Authorization": f"Bearer {api_token}",
@@ -116,80 +60,113 @@ def call_coze_api_stream(api_url, api_token, project_id, user_query):
         "project_id": project_id
     }
 
-    try:
-        # 使用占位符显示状态，方便后续清除
-        status_placeholder = st.empty()
-        status_placeholder.info(f"🚀 正在发送请求并等待智能体思考 (复杂问题可能需要较长时间)...")
-        
-        # 增加超时时间：连接超时 15s，读取超时 600s (10分钟)
-        # 针对深度搜索或复杂逻辑，智能体可能需要很久才开始输出
-        response = requests.post(api_url, headers=headers, json=payload, stream=True, timeout=(15, 600))
-        
-        if response.status_code != 200:
-            status_placeholder.empty()
-            error_msg = f"❌ 错误: 状态码 {response.status_code}\n\n响应详情: {response.text}"
-            st.error(error_msg)
-            yield error_msg
-            return
+    attempt = 0
+    while attempt <= retries:
+        try:
+            # 使用占位符显示状态
+            status_placeholder = st.empty()
+            if attempt > 0:
+                status_placeholder.warning(f"🔄 正在进行第 {attempt} 次重试...")
+            else:
+                status_placeholder.info(f"🚀 正在发送请求并等待智能体思考...")
+            
+            response = requests.post(api_url, headers=headers, json=payload, stream=True, timeout=(15, 600))
+            
+            if response.status_code == 401:
+                status_placeholder.empty()
+                st.error("❌ 授权失败 (401): 请检查您的 API Token 是否正确且未过期。")
+                return
+            elif response.status_code == 404:
+                status_placeholder.empty()
+                st.error("❌ 路径未找到 (404): 请检查您的 API 调用链接是否正确。")
+                return
+            elif response.status_code != 200:
+                status_placeholder.empty()
+                st.error(f"❌ 状态码 {response.status_code}: {response.text}")
+                return
 
-        has_data = False
-        for line in response.iter_lines():
-            if line:
-                if not has_data:
-                    status_placeholder.empty() # 收到第一行数据时清除提示
-                has_data = True
-                decoded_line = line.decode('utf-8').strip()
-                
-                # 调试日志：发送给 UI
-                yield f"DEBUG_RAW: {decoded_line}"
-                
-                if decoded_line.startswith('data:'):
-                    try:
-                        json_str = decoded_line[5:].strip()
-                        if not json_str:
-                            continue
-                        
-                        data_json = json.loads(json_str)
-                        
-                        # 使用先进的递归通用解析器
-                        content = extract_content_universally(data_json)
-                        
-                        if content:
-                            # 确保内容是字符串
-                            content_str = str(content)
-                            if content_str.strip():
-                                yield content_str
-                        
-                        # 检查结束标识
-                        event = data_json.get('event') or data_json.get('type')
-                        if event in ['done', 'conversation.message.completed'] or data_json.get('is_finished'):
-                            break
+            has_data = False
+            for line in response.iter_lines():
+                if st.session_state.get('stop_generation', False):
+                    yield "\n\n⚠️ **生成已由用户停止。**"
+                    return
+                    
+                if line:
+                    if not has_data:
+                        status_placeholder.empty()
+                    has_data = True
+                    decoded_line = line.decode('utf-8').strip()
+                    
+                    yield f"DEBUG_RAW: {decoded_line}"
+                    
+                    if decoded_line.startswith('data:'):
+                        try:
+                            json_str = decoded_line[5:].strip()
+                            if not json_str: continue
+                            data_json = json.loads(json_str)
+                            content = extract_content_universally(data_json)
+                            if content:
+                                yield str(content)
                             
-                    except json.JSONDecodeError:
-                        # 如果不是 JSON，尝试直接输出（排除一些心跳包或空行）
-                        if len(decoded_line) > 5:
-                            pass 
-                
-        if not has_data:
-            yield "⚠️ 收到响应但无数据流返回。请检查 Project ID 或 API Token 是否正确，或者该 API 链接是否支持流式输出。"
+                            event = data_json.get('event') or data_json.get('type')
+                            if event in ['done', 'conversation.message.completed'] or data_json.get('is_finished'):
+                                return
+                        except json.JSONDecodeError:
+                            pass
+            
+            if not has_data:
+                status_placeholder.empty()
+                if attempt < retries:
+                    attempt += 1
+                    continue
+                yield "⚠️ 收到响应但无数据流。请检查配置。"
+                return
+            return # 成功执行，退出循环
 
-    except requests.exceptions.ReadTimeout:
-        status_placeholder.empty()
-        yield "❌ 读取超时：智能体生成内容时间过长。这通常发生在处理极其复杂的任务时，请尝试拆分问题或稍后再试。"
-    except requests.exceptions.ConnectTimeout:
-        status_placeholder.empty()
-        yield "❌ 连接超时：无法连接到 Coze 服务器，请检查网络设置。"
-    except requests.exceptions.RequestException as e:
-        status_placeholder.empty()
-        yield f"❌ 网络请求异常: {str(e)}"
-    except Exception as e:
-        status_placeholder.empty()
-        yield f"❌ 发生未知异常: {str(e)}"
+        except (requests.exceptions.RequestException, Exception) as e:
+            status_placeholder.empty()
+            if attempt < retries:
+                attempt += 1
+                time.sleep(1) # 重试前稍等
+                continue
+            yield f"❌ 最终失败: {str(e)}"
+            return
 
 # 侧边栏配置
 with st.sidebar:
     st.title("⚙️ 配置中心")
     
+    # 预设管理
+    with st.expander("📂 配置预设 (Presets)", expanded=True):
+        preset_names = list(st.session_state.presets.keys())
+        selected_preset = st.selectbox("选择现有预设:", ["-- 请选择 --"] + preset_names)
+        
+        if selected_preset != "-- 请选择 --":
+            if st.button("📥 加载预设"):
+                p = st.session_state.presets[selected_preset]
+                st.session_state.api_url = p.get('api_url', "")
+                st.session_state.api_token = p.get('api_token', "")
+                st.session_state.project_id = p.get('project_id', "")
+                st.success(f"已加载: {selected_preset}")
+                time.sleep(0.5)
+                st.rerun()
+        
+        st.divider()
+        new_preset_name = st.text_input("新预设名称:", placeholder="例如: 绘图助手")
+        if st.button("💾 保存当前配置为新预设"):
+            if new_preset_name:
+                st.session_state.presets[new_preset_name] = {
+                    "api_url": st.session_state.api_url,
+                    "api_token": st.session_state.api_token,
+                    "project_id": st.session_state.project_id
+                }
+                save_presets(st.session_state.presets)
+                st.success(f"预设 '{new_preset_name}' 已保存！")
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.warning("请输入预设名称")
+
     # Curl 导入功能
     with st.expander("📥 导入 Curl 示例", expanded=False):
         curl_input = st.text_area("在此粘贴 Curl 命令:", height=150, placeholder="curl --location --request POST ...")
@@ -235,14 +212,18 @@ if debug_mode:
     st.sidebar.info("调试模式已开启，原始响应数据将显示在对话框下方。")
 
 # 显示历史消息
-for message in st.session_state.messages:
+for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        # 如果内容看起来像图片链接，尝试渲染
+        if is_image_url(message["content"]):
+            st.image(message["content"], caption="智能体生成的图片")
 
 # 用户输入
 if prompt := st.chat_input("输入您想说的话..."):
-    if not api_token or not project_id:
-        st.error("请先在侧边栏配置 API Token 和 Project ID！")
+    st.session_state.stop_generation = False # 重置停止状态
+    if not api_url or not api_token or not project_id:
+        st.error("请先在侧边栏配置 API 调用链接、API Token 和 Project ID！")
     else:
         # 添加用户消息到历史
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -251,6 +232,11 @@ if prompt := st.chat_input("输入您想说的话..."):
 
         # 调用 API 并流式显示回复
         with st.chat_message("assistant"):
+            # 停止按钮
+            stop_btn = st.button("🛑 停止生成")
+            if stop_btn:
+                st.session_state.stop_generation = True
+                
             response_placeholder = st.empty()
             full_response = ""
             
@@ -269,8 +255,28 @@ if prompt := st.chat_input("输入您想说的话..."):
                 
                 full_response += chunk
                 response_placeholder.markdown(full_response + "▌")
+                
+                # 如果发现图片链接，实时渲染预览（仅限最后一个 chunk 包含完整链接时）
+                # 注意：流式输出中图片链接可能被切分，这里简单处理
             
             response_placeholder.markdown(full_response)
+            if is_image_url(full_response):
+                st.image(full_response.strip(), caption="智能体生成的图片")
         
         # 添加助手消息到历史
         st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+# 底部功能区
+if st.session_state.messages:
+    st.divider()
+    col1, col2, col3 = st.columns([1, 1, 4])
+    with col1:
+        if st.button("🗑️ 清空当前对话"):
+            st.session_state.messages = []
+            st.rerun()
+    with col2:
+        # 导出对话
+        chat_text = ""
+        for m in st.session_state.messages:
+            chat_text += f"{m['role'].upper()}: {m['content']}\n\n"
+        st.download_button("📥 导出对话记录", chat_text, file_name=f"coze_chat_{int(time.time())}.txt")

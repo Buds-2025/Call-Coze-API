@@ -1,11 +1,18 @@
 import requests
 import json
-import sys
 import argparse
+import sys
+from utils import parse_curl, extract_content_universally, load_presets
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.live import Live
 
-def call_coze_api(api_url, api_token, project_id, user_query):
+console = Console()
+
+def call_coze_api_stream(api_url, api_token, project_id, user_query):
     """
-    调用 Coze 智能体 API
+    调用 Coze 智能体 API 并返回生成器以支持流式显示
     """
     headers = {
         "Authorization": f"Bearer {api_token}",
@@ -29,117 +36,101 @@ def call_coze_api(api_url, api_token, project_id, user_query):
         "project_id": project_id
     }
 
-    print(f"\n[发送请求] URL: {api_url}")
-    print(f"[项目 ID]: {project_id}")
-    print(f"[对话内容]: {user_query}")
-    print("-" * 50)
-
     try:
-        # 使用 stream=True 处理流式输出
-        response = requests.post(api_url, headers=headers, json=payload, stream=True)
+        # 增加超时时间：连接超时 15s，读取超时 600s
+        response = requests.post(api_url, headers=headers, json=payload, stream=True, timeout=(15, 600))
         
         if response.status_code != 200:
-            print(f"错误: 状态码 {response.status_code}")
-            print(f"响应内容: {response.text}")
+            console.print(f"[bold red]❌ 错误: 状态码 {response.status_code}[/bold red]")
+            console.print(f"响应详情: {response.text}")
             return
 
-        print("收到回复 (流式输出):\n")
-        
-        full_response = ""
         for line in response.iter_lines():
             if line:
-                decoded_line = line.decode('utf-8')
-                
-                # Coze 的流式输出通常以 'data:' 开头
+                decoded_line = line.decode('utf-8').strip()
                 if decoded_line.startswith('data:'):
                     try:
-                        # 提取 JSON 部分
                         json_str = decoded_line[5:].strip()
-                        if not json_str:
-                            continue
-                            
+                        if not json_str: continue
                         data_json = json.loads(json_str)
                         
-                        # 处理 Coze 的各种事件类型
-                        # conversation.message.delta: 消息增量
-                        # conversation.message.completed: 消息完成
-                        event = data_json.get('event') or data_json.get('type')
-                        
-                        # 尝试提取内容
-                        content = ""
-                        if 'content' in data_json:
-                            raw_content = data_json['content']
-                            if isinstance(raw_content, str):
-                                content = raw_content
-                            elif isinstance(raw_content, dict) and 'text' in raw_content:
-                                content = raw_content['text']
-                        
+                        # 使用通用的递归内容提取
+                        content = extract_content_universally(data_json)
                         if content:
-                            print(content, end='', flush=True)
-                            full_response += content
-                        
-                        # 检查完成标识
-                        if event in ['done', 'conversation.message.completed'] or data_json.get('is_finished'):
-                            # 有些 API 在 done 时可能还会带上最后的完整内容，这里我们已经通过 delta 输出了
-                            pass
+                            yield content
                             
+                        # 检查结束标识
+                        event = data_json.get('event') or data_json.get('type')
+                        if event in ['done', 'conversation.message.completed'] or data_json.get('is_finished'):
+                            break
                     except json.JSONDecodeError:
-                        # 忽略非 JSON 行
                         pass
-                elif decoded_line.startswith('event:'):
-                    # 可以记录事件类型，但不一定需要输出
-                    pass
-
-        print("\n" + "-" * 50)
-        print("对话结束。")
-
     except Exception as e:
-        print(f"调用 API 时发生错误: {e}")
+        console.print(f"[bold red]❌ 发生异常: {str(e)}[/bold red]")
 
 def main():
     parser = argparse.ArgumentParser(description="Coze 智能体 API 调用工具")
-    parser.add_argument("--url", help="API 调用链接", default="https://zfwgj2s2zx.coze.site/stream_run")
+    parser.add_argument("--url", help="API 调用链接")
     parser.add_argument("--token", help="API Token")
     parser.add_argument("--project_id", help="Project ID")
     parser.add_argument("--query", help="对话内容")
+    parser.add_argument("--config", help="从 JSON 配置文件加载预设")
     
     args = parser.parse_args()
 
-    print("=== Coze 智能体 API 调用工具 ===")
+    console.print(Panel("[bold blue]🤖 Coze 智能体终端工具[/bold blue]", expand=False))
     
-    # 优先使用命令行参数，如果没有则进入交互模式
     api_url = args.url
     api_token = args.token
     project_id = args.project_id
     
-    if not api_token:
-        api_token = input("请输入 API Token: ").strip()
-    if not project_id:
-        project_id = input("请输入 project_id: ").strip()
-
-    if not api_token or not project_id:
-        print("错误: API Token 和 Project ID 是必须的。")
-        return
-
-    # 如果命令行提供了 query，则只执行一次
-    if args.query:
-        call_coze_api(api_url, api_token, project_id, args.query)
-        return
-
-    # 否则进入循环对话模式
-    while True:
+    # 如果指定了配置文件
+    if args.config:
         try:
-            user_query = input("\n请输入对话内容 (输入 'exit' 退出): ").strip()
-            if user_query.lower() in ['exit', 'quit', '退出']:
-                break
-            
-            if not user_query:
-                continue
-                
-            call_coze_api(api_url, api_token, project_id, user_query)
-        except KeyboardInterrupt:
-            print("\n程序已退出。")
-            break
+            with open(args.config, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                api_url = config.get("api_url", api_url)
+                api_token = config.get("api_token", api_token)
+                project_id = config.get("project_id", project_id)
+                console.print(f"[green]✅ 已从配置文件 {args.config} 加载配置[/green]")
+        except Exception as e:
+            console.print(f"[red]❌ 加载配置文件失败: {e}[/red]")
+
+    # 交互式输入
+    if not api_url: api_url = console.input("[bold yellow]请输入 API URL:[/bold yellow] ").strip()
+    if not api_token: api_token = console.input("[bold yellow]请输入 API Token:[/bold yellow] ", password=True).strip()
+    if not project_id: project_id = console.input("[bold yellow]请输入 Project ID:[/bold yellow] ").strip()
+
+    if not api_url or not api_token or not project_id:
+        console.print("[red]错误: API URL, Token 和 Project ID 都是必须的。[/red]")
+        return
+
+    # 进入对话循环
+    console.print("\n[dim]提示: 输入 'exit' 或 'quit' 退出，输入 'clear' 清屏。[/dim]")
+    
+    while True:
+        if args.query:
+            user_query = args.query
+        else:
+            user_query = console.input("\n[bold green]👤 您:[/bold green] ").strip()
+        
+        if not user_query: continue
+        if user_query.lower() in ['exit', 'quit']: break
+        if user_query.lower() == 'clear':
+            console.clear()
+            continue
+
+        console.print("[bold blue]🤖 助手:[/bold blue] ", end="")
+        
+        full_response = ""
+        with Live(console=console, refresh_per_second=10) as live:
+            for chunk in call_coze_api_stream(api_url, api_token, project_id, user_query):
+                full_response += chunk
+                # 实时渲染 Markdown 可能会有性能开销，但对于流式文本效果很好
+                live.update(Markdown(full_response))
+        
+        # 如果是命令行一次性查询，则退出
+        if args.query: break
 
 if __name__ == "__main__":
     main()
